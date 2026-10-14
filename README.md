@@ -4,7 +4,7 @@
 ![Python](https://img.shields.io/badge/Python-3.7%2B-38bdf8)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-8fa2b5)
 
-> 把 `E:\工作区DS`（或任意目录）下的所有纯前端项目托管到**一个** HTTP 服务上，
+> 把任意目录下的所有纯前端项目托管到**一个** HTTP 服务上，
 > 配一个导航页，点一下就能打开任意项目。默认端口 **1938**，改配置文件即可换。
 
 零第三方依赖，只用 Python 标准库。
