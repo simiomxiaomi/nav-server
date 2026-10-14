@@ -4,7 +4,7 @@
 ![Python](https://img.shields.io/badge/Python-3.7%2B-38bdf8)
 ![Dependencies](https://img.shields.io/badge/dependencies-0-8fa2b5)
 
-> 把任意目录下的所有纯前端项目托管到**一个** HTTP 服务上，
+> 把 `E:\工作区DS`（或任意目录）下的所有纯前端项目托管到**一个** HTTP 服务上，
 > 配一个导航页，点一下就能打开任意项目。默认端口 **1938**，改配置文件即可换。
 
 零第三方依赖，只用 Python 标准库。
@@ -30,6 +30,9 @@ python nav-server.py          →  打开 http://127.0.0.1:1938/
 
 ## 两种部署方式
 
+> 📖 **完整部署流程（从克隆仓库到服务启动、开机自启、防火墙、排错）见
+> [DEPLOY-LINUX.md](DEPLOY-LINUX.md)。** 下面是精简版。
+
 ### 方式一：直接用 Python 启动（最省事）
 
 ```bash
@@ -48,6 +51,7 @@ python nav-server.py
 | `--host <地址>` | 临时覆盖监听地址 |
 | `--list` | 只列出项目就绪情况，不启动服务 |
 | `-q, --quiet` | 不打印每个请求的访问日志 |
+| `-v, --version` | 打印版本 |
 
 ### 方式二：用 shell 脚本管理（Linux / macOS / WSL）
 
@@ -222,7 +226,8 @@ python _check_bash.py nav-server.sh   # shell 结构检查
 
 - `_selftest.py`（53 项）— 配置解析与各类非法配置的拒绝、GitHub 地址解析、代理拼接、路径穿越防护、端口探测、无 git 时的降级、缓存命中/强制刷新、导航页渲染与转义、默认值
 - `_check_bash.py` — `nav-server.sh` 的引号闭合、`if/fi` `case/esac` `do/done` 配对、here-doc 终止符、内部函数调用是否有定义（21 个函数全部成对）
-- **端到端实测**（真启服务打请求）：9 个项目 `/apps/<id>/` 全部 200；`style.css` / `app.js` / `README.md` 的 MIME 类型正确；不存在的项目 / 文件 / 路径返回 404；三种路径穿越姿势全部被拒（403/404，未泄露配置）
+- `_check_docs.py`（88 项）— 文档里提到的每个文件、命令行参数、shell 子命令、HTTP 接口、配置字段是否真实存在；交叉链接是否有效
+- `_e2e.py`（49 项，**真启服务打请求**）— 9 个项目 `/apps/<id>/` 全部 200；静态资源 MIME 类型正确；挂载点缺斜杠自动 302；不存在的项目/文件/路径返回 404；4 种路径穿越姿势全部被拒；更新检测接口；配置热重载；24 个并发请求全通过
 
 **尚未验证：**
 
@@ -261,11 +266,14 @@ nav-server/
 ├── nav-server.sh          Linux/macOS 进程管理脚本
 ├── config.json            配置（端口、项目列表）
 ├── config.example.json    带注释说明的配置样例
+├── DEPLOY-LINUX.md        Linux 部署实操手册（从 clone 到启动）
 ├── README.md              本文件
 ├── LICENSE                MIT
 ├── .gitignore
 ├── _selftest.py           逻辑自测（53 项）
-└── _check_bash.py         shell 结构检查器
+├── _e2e.py                端到端实测（49 项，真启服务打请求）
+├── _check_bash.py         shell 结构检查器
+└── _check_docs.py         文档一致性检查（88 项）
 ```
 
 ---
