@@ -1,0 +1,95 @@
+{
+  "port": 1938,
+  "host": "0.0.0.0",
+  "title": "工作区导航",
+  "root": "..",
+  "cacheTTL": 300,
+  "remote": "origin",
+  "branch": "main",
+  "proxy": "",
+  "openOnStart": false,
+  "timeout": 6,
+  "projects": [
+    {
+      "id": "markdown-studio",
+      "name": "Markdown Studio",
+      "icon": "📝",
+      "path": "markdown-studio",
+      "desc": "Markdown 实时预览编辑器 · 手写解析器 / 同步滚动 / 导出独立 HTML",
+      "tag": "Tool",
+      "repo": "https://github.com/simiomxiaomi/markdown-studio"
+    },
+    {
+      "id": "regex-tester",
+      "name": "RegEx Studio",
+      "icon": "🔍",
+      "path": "regex-tester",
+      "desc": "正则表达式测试器 · 实时高亮 / 分组拆解 / 19 条常用正则库",
+      "tag": "Tool",
+      "repo": "https://github.com/simiomxiaomi/regex-tester"
+    },
+    {
+      "id": "color-lab",
+      "name": "Color Lab",
+      "icon": "🎨",
+      "path": "color-lab",
+      "desc": "颜色工具与调色板 · 色阶生成 / WCAG 对比度 / 图片取色",
+      "tag": "Tool",
+      "repo": "https://github.com/simiomxiaomi/color-lab"
+    },
+    {
+      "id": "text-toolbox",
+      "name": "Text Toolbox",
+      "icon": "🧰",
+      "path": "text-toolbox",
+      "desc": "文本处理工具箱 · 40+ 操作 / JSON 自动修复 / 实时统计",
+      "tag": "Tool",
+      "repo": "https://github.com/simiomxiaomi/text-toolbox"
+    },
+    {
+      "id": "diff-viewer",
+      "name": "Diff Viewer",
+      "icon": "±",
+      "path": "diff-viewer",
+      "desc": "文本对比器 · LCS 逐行差异 / 字符级高亮 / 导出补丁",
+      "tag": "Tool",
+      "repo": "https://github.com/simiomxiaomi/diff-viewer"
+    },
+    {
+      "id": "pixel-art-studio",
+      "name": "Pixel Art Studio",
+      "icon": "🎯",
+      "path": "pixel-art-studio",
+      "desc": "像素画编辑器 · Canvas 绘制 / 撤销重做 / 导出 PNG",
+      "tag": "Web",
+      "repo": "https://github.com/simiomxiaomi/pixel-art-studio"
+    },
+    {
+      "id": "json-viewer",
+      "name": "JSON Viewer",
+      "icon": "🧩",
+      "path": "json-viewer",
+      "desc": "JSON 格式化与树形查看 · 错误定位 / 可折叠树 / 搜索高亮",
+      "tag": "Tool",
+      "repo": "https://github.com/simiomxiaomi/json-viewer"
+    },
+    {
+      "id": "focus-timer",
+      "name": "Focus Timer",
+      "icon": "⏱",
+      "path": "focus-timer",
+      "desc": "番茄钟 · 三模式 / SVG 环形进度 / Web Audio 合成提示音",
+      "tag": "App",
+      "repo": "https://github.com/simiomxiaomi/focus-timer"
+    },
+    {
+      "id": "linux-cmd-find",
+      "name": "Linux CMD Finder",
+      "icon": "🐧",
+      "path": "linux-cmd-find",
+      "desc": "Linux 命令速查 · 205 条命令 / 多字段搜索 / 键盘流操作",
+      "tag": "Tool",
+      "repo": "https://github.com/simiomxiaomi/linux-cmd-find"
+    }
+  ]
+}
