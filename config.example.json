@@ -10,6 +10,10 @@
   "_proxy": "可选。GitHub API 镜像前缀，留空表示直连。例如填 https://ghproxy.net",
   "_openOnStart": "启动后是否自动打开浏览器（true / false）",
   "_timeout": "git 与网络检测的超时秒数",
+  "_autoSync": "启动时是否自动拉取项目。\"always\" = 缺失的自动安装、已有的自动更新；\"missing\" = 只安装缺失的；false = 不自动（只能用界面按钮或 --sync）",
+  "_syncMode": "更新方式。\"ff\" = 只允许快进合并（安全，本地有分叉时会失败并提示）；\"hard\" = fetch 后 reset --hard 对齐远端（会丢弃本地改动，慎用）",
+  "_zipFallback": "没有 git 或 clone 失败时，是否回退到 GitHub 压缩包下载解压（true / false）",
+  "_syncTimeout": "clone / pull / 下载的超时秒数，慢网络可以调大",
   "_projects": "项目列表。每项：id(访问路径) / name / icon / path(相对 root) / desc / tag / repo",
 
   "port": 1938,
@@ -22,6 +26,10 @@
   "proxy": "",
   "openOnStart": false,
   "timeout": 6,
+  "autoSync": "always",
+  "syncMode": "ff",
+  "zipFallback": true,
+  "syncTimeout": 120,
 
   "projects": [
     {

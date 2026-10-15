@@ -10,12 +10,16 @@
     python nav-server.py --config other.json # 指定配置文件
     python nav-server.py --port 8080         # 临时覆盖端口（不改配置）
     python nav-server.py --list              # 只列出项目与状态，不启动服务
+    python nav-server.py --sync              # 拉取 / 部署一遍项目后退出
+    python nav-server.py --no-auto-sync      # 本次启动不做自动拉取
 
 特性：
   · 零第三方依赖，只用 Python 标准库
   · 端口 / 项目列表 / 代理全部由 config.json 控制
   · 每个项目挂在 /apps/<id>/ 下，导航页一键跳转
-  · 附「检测更新」：对比本地与远端仓库，无需拉取代码
+  · 「自动部署」：缺失的项目自动 git clone；已有的自动 git pull
+    （没有 git 时回退到 GitHub 压缩包下载解压）
+  · 附「检测更新」：只读对比本地与远端仓库，不改动任何文件
 
 作者：苏小晗 · MIT License
 """
@@ -24,14 +28,17 @@ import argparse
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from email.utils import formatdate, parsedate_to_datetime
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -48,12 +55,25 @@ for _stream_name in ("stdout", "stderr"):
         except (ValueError, OSError):
             pass
 
+# 输出重定向到日志文件时默认是块缓冲，后台跑会「看不到日志」。
+# 打开行缓冲，让 banner、拉取进度这些能立刻写进 nav-server.log。
+_reconfigure = getattr(getattr(sys, "stdout", None), "reconfigure", None)
+if _reconfigure is not None:
+    try:
+        _reconfigure(line_buffering=True)
+    except (ValueError, OSError):
+        pass
+
 # ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 HERE = Path(__file__).resolve().parent
 DEFAULT_CONFIG = HERE / "config.json"
+
+# 用 zip 兜底部署时留下的标记文件：有它才说明这个目录归 nav-server 管，
+# 之后才允许再次用 zip 覆盖更新（避免动到用户自己放的代码）。
+ZIP_MARKER = ".nav-server-zip"
 
 MIME_EXTRA = {
     ".md": "text/markdown; charset=utf-8",
@@ -67,17 +87,59 @@ MIME_EXTRA = {
 _UPDATE_CACHE = {}
 _CACHE_LOCK = threading.Lock()
 
+# 拉取 / 部署任务的共享状态（后台线程写，HTTP 线程读）
+SYNC_STATE = {
+    "running": False,
+    "mode": "",             # auto | manual | single
+    "startedAt": "",
+    "finishedAt": "",
+    "total": 0,
+    "results": [],
+    "summary": "",
+    "ids": [],
+}
+_SYNC_LOCK = threading.Lock()
+
 
 # ---------------------------------------------------------------------------
 # 配置
 # ---------------------------------------------------------------------------
+def parse_bool(value):
+    """把 JSON 里的 true/false、"true"/"false"、"1"/"0" 统一成 bool。返回 (是否可解析, 值)"""
+    if isinstance(value, bool):
+        return True, value
+    if isinstance(value, (int, float)):
+        return True, bool(value)
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True, True
+    if text in ("0", "false", "no", "off", ""):
+        return True, False
+    return False, False
+
+
+def normalize_auto_sync(value):
+    """autoSync 的三种取值：never / missing / always；无法识别返回 None"""
+    if isinstance(value, bool):
+        return "always" if value else "never"
+    text = str(value).strip().lower()
+    if text in ("always", "all", "true", "1", "yes", "on"):
+        return "always"
+    if text in ("missing", "install", "bootstrap"):
+        return "missing"
+    if text in ("never", "off", "false", "0", "no", "none", "disable", "disabled"):
+        return "never"
+    return None
+
+
 def load_config(path):
     """读取配置并补齐默认值，返回 (config, 错误信息)"""
     p = Path(path)
     if not p.is_file():
         return None, "找不到配置文件：%s" % p
     try:
-        raw = json.loads(p.read_text(encoding="utf-8"))
+        # utf-8-sig：Windows 记事本存的配置常带 BOM，不能因此报「不是合法 JSON」
+        raw = json.loads(p.read_text(encoding="utf-8-sig"))
     except json.JSONDecodeError as e:
         return None, "配置文件不是合法 JSON：第 %d 行第 %d 列 — %s" % (e.lineno, e.colno, e.msg)
     except OSError as e:
@@ -97,6 +159,10 @@ def load_config(path):
         "proxy": "",
         "openOnStart": False,
         "timeout": 6,
+        "autoSync": "always",
+        "syncMode": "ff",
+        "zipFallback": True,
+        "syncTimeout": 120,
         "projects": [],
     }
 
@@ -117,6 +183,27 @@ def load_config(path):
         cfg["cacheTTL"] = max(0, int(cfg["cacheTTL"]))
     except (TypeError, ValueError):
         return None, "timeout / cacheTTL 必须是数字"
+
+    try:
+        cfg["syncTimeout"] = max(10, int(cfg["syncTimeout"]))
+    except (TypeError, ValueError):
+        return None, "syncTimeout 必须是数字（建议 60 以上）"
+
+    cfg["autoSync"] = normalize_auto_sync(cfg["autoSync"])
+    if cfg["autoSync"] is None:
+        return None, "autoSync 只能是 false / \"missing\" / \"always\""
+
+    mode = str(cfg["syncMode"] or "ff").strip().lower()
+    if mode in ("ff-only", "ff_only", "pull", "safe", "fast-forward"):
+        mode = "ff"
+    if mode not in ("ff", "hard"):
+        return None, "syncMode 只能是 \"ff\"（只允许快进）或 \"hard\"（强制对齐远端）"
+    cfg["syncMode"] = mode
+
+    ok, flag = parse_bool(cfg["zipFallback"])
+    if not ok:
+        return None, "zipFallback 只能是 true / false"
+    cfg["zipFallback"] = flag
 
     if not isinstance(cfg["projects"], list):
         return None, "projects 必须是数组"
@@ -144,9 +231,6 @@ def load_config(path):
         seen.add(pid)
 
         rel = str(entry.get("path") or pid).strip()
-        target = Path(rel)
-        if not target.is_absolute():
-            target = (root / rel).resolve()
 
         items.append({
             "id": pid,
@@ -156,14 +240,30 @@ def load_config(path):
             "tag": str(entry.get("tag") or "App"),
             "repo": str(entry.get("repo") or ""),
             "path": rel,
-            "dir": target,
-            "exists": target.is_dir(),
-            "entry": (target / "index.html").is_file(),
-            "files": count_files(target) if target.is_dir() else 0,
+            "dir": root / rel,
+            "exists": False,
+            "entry": False,
+            "files": 0,
         })
     cfg["projects"] = items
+    # 目录 / index.html / 文件数统一在这里算，拉取之后复用同一个函数刷新
+    refresh_project_state(cfg)
     cfg["configPath"] = str(p.resolve())
     return cfg, None
+
+
+def refresh_project_state(cfg):
+    """重新扫描每个项目的目录，刷新 dir / exists / entry / files（同步完成或重载配置后调用）"""
+    root = Path(cfg["rootPath"])
+    for p in cfg["projects"]:
+        target = Path(p["path"])
+        if not target.is_absolute():
+            target = (root / p["path"]).resolve()
+        p["dir"] = target
+        p["exists"] = target.is_dir()
+        p["entry"] = (target / "index.html").is_file()
+        p["files"] = count_files(target) if p["exists"] else 0
+    return cfg
 
 
 def count_files(directory):
@@ -187,6 +287,11 @@ def count_files(directory):
 # ---------------------------------------------------------------------------
 def run_git(args, cwd, timeout=8):
     """执行 git 命令，返回 (成功, 输出或错误信息)"""
+    env = dict(os.environ)
+    # 服务是无人值守的：绝不能让 git 卡在「输入用户名/密码」上
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_ASKPASS"] = env.get("GIT_ASKPASS") or "true"
+    env["SSH_ASKPASS"] = env.get("SSH_ASKPASS") or "true"
     try:
         proc = subprocess.run(
             ["git"] + args,
@@ -196,6 +301,7 @@ def run_git(args, cwd, timeout=8):
             timeout=timeout,
             encoding="utf-8",
             errors="replace",
+            env=env,
         )
     except FileNotFoundError:
         return False, "未安装 git（命令不可用）"
@@ -377,6 +483,398 @@ def finish(result, cfg, pid):
 
 
 # ---------------------------------------------------------------------------
+# 拉取 / 部署：把 config.json 里的 repo 真正落到磁盘
+# ---------------------------------------------------------------------------
+SYNC_STATUS_TEXT = {
+    "installed": "已部署",
+    "updated": "已更新",
+    "current": "已最新",
+    "skipped": "已跳过",
+    "failed": "失败",
+    "running": "进行中",
+}
+
+
+def now_text():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def zip_url_for(cfg, project):
+    """GitHub 压缩包地址（codeload），返回时不带 proxy 前缀"""
+    repo = normalize_github_repo(project.get("repo") or "")
+    if not repo:
+        return ""
+    branch = str(cfg.get("branch") or "main")
+    return "https://codeload.github.com/%s/zip/refs/heads/%s" % (
+        repo, urllib.parse.quote(branch),
+    )
+
+
+def with_proxy(cfg, url):
+    """按配置给 URL 加上镜像前缀"""
+    proxy = str(cfg.get("proxy") or "").strip()
+    if proxy and url:
+        return proxy.rstrip("/") + "/" + url
+    return url
+
+
+def download_file(cfg, url, target):
+    """下载 url 到 target，返回 (成功, 说明)"""
+    req = urllib.request.Request(url, headers={"User-Agent": "nav-server/%s" % VERSION})
+    try:
+        with urllib.request.urlopen(req, timeout=int(cfg.get("syncTimeout") or 120)) as resp:
+            data = resp.read()
+    except urllib.error.HTTPError as e:
+        return False, "下载失败：HTTP %s" % e.code
+    except urllib.error.URLError as e:
+        return False, "下载失败：%s" % e.reason
+    except OSError as e:
+        return False, "下载失败：%s" % e
+    if not data:
+        return False, "下载失败：收到空响应"
+    try:
+        target.write_bytes(data)
+    except OSError as e:
+        return False, "写入临时文件失败：%s" % e
+    return True, "已下载 %.0f KB" % (len(data) / 1024.0)
+
+
+def safe_extract_zip(zip_path, dest):
+    """把压缩包解压到 dest，挡掉绝对路径与 ../ 穿越条目，返回解压出的文件数"""
+    dest = Path(dest).resolve()
+    dest.mkdir(parents=True, exist_ok=True)
+    count = 0
+    with zipfile.ZipFile(zip_path) as zf:
+        for info in zf.infolist():
+            name = info.filename.replace("\\", "/")
+            if not name or name.startswith("/") or ".." in Path(name).parts:
+                continue
+            out = (dest / name).resolve()
+            try:
+                out.relative_to(dest)
+            except ValueError:
+                continue
+            if info.is_dir():
+                out.mkdir(parents=True, exist_ok=True)
+                continue
+            out.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(info) as src, open(out, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            count += 1
+    return count
+
+
+def zip_root_of(directory):
+    """GitHub 的 zip 里只有一个 repo-branch/ 顶层目录，返回它（结构异常时返回原目录）"""
+    directory = Path(directory)
+    try:
+        items = list(directory.iterdir())
+    except OSError:
+        return directory
+    if len(items) == 1 and items[0].is_dir():
+        return items[0]
+    return directory
+
+
+def copy_tree_into(src, dst):
+    """把 src 里的内容合并复制到 dst（不用 copytree 的 dirs_exist_ok，Python 3.7 也能跑）"""
+    dst = Path(dst)
+    dst.mkdir(parents=True, exist_ok=True)
+    for item in Path(src).iterdir():
+        target = dst / item.name
+        if item.is_dir():
+            copy_tree_into(item, target)
+        else:
+            shutil.copy2(item, target)
+
+
+def make_work_dir(near):
+    """给下载 / 解压找个临时目录：优先用目标目录旁边（同盘、权限一致），
+    不行再退回系统临时目录"""
+    try:
+        cand = Path(near).parent / (".nav-server-tmp-%d" % os.getpid())
+        cand.mkdir(parents=True, exist_ok=True)
+        return cand
+    except OSError:
+        return Path(tempfile.mkdtemp(prefix="nav-zip-"))
+
+
+def install_from_zip(cfg, project):
+    """用 GitHub 压缩包把项目部署到目标目录（没有 git，或 clone 失败时的兜底）"""
+    target = Path(project["dir"])
+    url = zip_url_for(cfg, project)
+    if not url:
+        return False, "仓库地址解析不出 owner/repo，无法用压缩包兜底"
+
+    tmp = make_work_dir(target)
+    try:
+        zpath = tmp / "repo.zip"
+        ok, msg = download_file(cfg, with_proxy(cfg, url), zpath)
+        if not ok:
+            return False, msg
+
+        raw = tmp / "raw"
+        try:
+            count = safe_extract_zip(zpath, raw)
+        except zipfile.BadZipFile:
+            return False, "下载到的不是有效压缩包（网络被劫持时可试试配置 proxy 镜像）"
+        except OSError as e:
+            return False, "解压失败：%s" % e
+        if not count:
+            return False, "压缩包里没有文件"
+
+        src = zip_root_of(raw)
+        try:
+            copy_tree_into(src, target)
+            # 打上标记：这个目录由 nav-server 用压缩包部署，之后允许它继续覆盖更新
+            (target / ZIP_MARKER).write_text(
+                "repo=%s\nbranch=%s\nat=%s\n" % (
+                    project.get("repo") or "", cfg.get("branch") or "", now_text(),
+                ),
+                encoding="utf-8",
+            )
+        except OSError as e:
+            return False, "写入项目目录失败：%s" % e
+        return True, "%s，解压 %d 个文件" % (msg, count)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def sync_project(cfg, project):
+    """对单个项目执行一次同步：缺失就安装，已有就更新。返回结果字典。"""
+    pid = project["id"]
+    target = Path(project["dir"])
+    repo = str(project.get("repo") or "").strip()
+    branch = str(cfg.get("branch") or "main")
+    timeout = int(cfg.get("syncTimeout") or 120)
+    mode = cfg.get("syncMode") or "ff"
+    zip_ok = bool(cfg.get("zipFallback"))
+
+    result = {
+        "id": pid,
+        "name": project.get("name") or pid,
+        "status": "failed",          # installed | updated | current | skipped | failed
+        "message": "",
+        "at": now_text(),
+    }
+
+    def done(status, message):
+        result["status"] = status
+        result["message"] = message
+        return result
+
+    if not repo:
+        return done("skipped", "配置里没有 repo 地址，跳过")
+
+    is_git = (target / ".git").is_dir()
+
+    # ---- 情况一：目录存在且是 git 仓库 → 拉取更新 ----
+    if target.is_dir() and is_git:
+        ok, before = run_git(["rev-parse", "HEAD"], target, timeout)
+        before = before if ok else ""
+
+        if mode == "hard":
+            ok, out = run_git(["fetch", "--prune", "origin", branch], target, timeout)
+            if not ok:
+                return done("failed", "fetch 失败：%s" % out)
+            ok, out = run_git(["reset", "--hard", "origin/%s" % branch], target, timeout)
+            if not ok:
+                return done("failed", "reset --hard 失败：%s" % out)
+        else:
+            ok, out = run_git(["pull", "--ff-only"], target, timeout)
+            if not ok:
+                # 当前分支没配上游时 pull 会直接失败，退回 fetch + merge --ff-only
+                f_ok, f_out = run_git(["fetch", "origin", branch], target, timeout)
+                if not f_ok:
+                    return done("failed", "pull 失败：%s；fetch 也失败：%s" % (out, f_out))
+                m_ok, m_out = run_git(["merge", "--ff-only", "origin/%s" % branch], target, timeout)
+                if not m_ok:
+                    return done(
+                        "failed",
+                        "无法快进合并：%s（本地有分叉时可把 syncMode 改成 \"hard\"）" % m_out,
+                    )
+
+        ok, after = run_git(["rev-parse", "--short", "HEAD"], target, timeout)
+        after = after if ok else ""
+        if before and after and before.startswith(after):
+            return done("current", "已是最新（%s）" % after)
+        return done("updated", "已更新到 %s" % (after or "最新版本"))
+
+    # ---- 情况二：目录存在但不是 git 仓库 ----
+    if target.is_dir() and not is_git:
+        marker = target / ZIP_MARKER
+        try:
+            empty = not any(target.iterdir())
+        except OSError:
+            empty = False
+
+        if marker.is_file():
+            if not zip_ok:
+                return done("skipped", "这个目录是压缩包部署的，但 zipFallback 已关闭，跳过")
+            ok, msg = install_from_zip(cfg, project)
+            return done("updated", msg) if ok else done("failed", msg)
+
+        if not empty:
+            return done("skipped", "目录已存在且不是 git 仓库，跳过（不动你自己的文件）")
+
+    # ---- 情况三：目录不存在（或是个空目录）→ 克隆 / 下载 ----
+    try:
+        empty_dir = target.is_dir() and not any(target.iterdir())
+    except OSError:
+        empty_dir = False
+    if target.exists() and not empty_dir:
+        # 既不是 git 仓库、又不是空目录 → 不动它
+        return done("skipped", "目标路径已存在且不是空目录，跳过")
+
+    parent = target.parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return done("failed", "无法创建目录 %s：%s" % (parent, e))
+
+    clone_err = ""
+    ok, out = run_git(["clone", "--single-branch", "--branch", branch, repo, str(target)], parent, timeout)
+    if ok:
+        return done("installed", "已克隆 %s 分支" % branch)
+
+    clone_err = out
+    # 分支名可能不叫 config 里写的那个 → 用仓库默认分支再试一次
+    ok2, out2 = run_git(["clone", "--single-branch", repo, str(target)], parent, timeout)
+    if ok2:
+        return done("installed", "已克隆（仓库默认分支，配置里的 branch=%s 可能不存在）" % branch)
+    if out2 and out2 != clone_err:
+        clone_err = "%s / %s" % (clone_err, out2)
+
+    if zip_ok:
+        z_ok, z_msg = install_from_zip(cfg, project)
+        if z_ok:
+            return done("installed", "git 克隆失败（%s），改用压缩包：%s" % (clone_err or "原因未知", z_msg))
+        return done("failed", "克隆失败：%s；压缩包兜底也失败：%s" % (clone_err or "原因未知", z_msg))
+
+    return done("failed", "克隆失败：%s（可打开 zipFallback 用压缩包部署，或配置 proxy 镜像）"
+                % (clone_err or "原因未知"))
+
+
+def summarize_sync(results):
+    """把结果列表汇总成一句话"""
+    if not results:
+        return "没有需要拉取的项目"
+    parts = []
+    for key in ("installed", "updated", "current", "skipped", "failed"):
+        n = sum(1 for r in results if r.get("status") == key)
+        if n:
+            parts.append("%s %d" % (SYNC_STATUS_TEXT.get(key, key), n))
+    return "拉取完成：" + "，".join(parts)
+
+
+def pick_sync_targets(cfg, only_ids=None):
+    """挑出需要同步的项目：必须配了 repo；只有非 git 仓库才需要额外判断"""
+    targets = []
+    for p in cfg["projects"]:
+        if only_ids and p["id"] not in only_ids:
+            continue
+        if not (p.get("repo") or "").strip():
+            continue
+        targets.append(p)
+    return targets
+
+
+def sync_status_payload(cfg=None):
+    """给前端轮询用的同步进度"""
+    with _SYNC_LOCK:
+        payload = {
+            "running": SYNC_STATE["running"],
+            "mode": SYNC_STATE["mode"],
+            "startedAt": SYNC_STATE["startedAt"],
+            "finishedAt": SYNC_STATE["finishedAt"],
+            "total": SYNC_STATE["total"],
+            "done": len(SYNC_STATE["results"]),
+            "results": [dict(r) for r in SYNC_STATE["results"]],
+            "summary": SYNC_STATE["summary"],
+            "ids": list(SYNC_STATE.get("ids") or []),
+        }
+    if cfg is not None:
+        payload["projects"] = {
+            p["id"]: {"exists": p["exists"], "entry": p["entry"], "files": p["files"],
+                      "dir": str(p["dir"])}
+            for p in cfg["projects"]
+        }
+    return payload
+
+
+def start_sync_batch(cfg, only_ids=None, mode_label="manual"):
+    """后台线程跑一次同步，返回 (是否已启动, 说明)。同一时间只允许一个任务。"""
+    with _SYNC_LOCK:
+        if SYNC_STATE["running"]:
+            return False, "已经有一个拉取任务在进行中，请稍候"
+        targets = pick_sync_targets(cfg, only_ids)
+        if not targets:
+            return False, "没有可拉取的项目（检查一下这些项目的 repo 字段）"
+        SYNC_STATE.update({
+            "running": True,
+            "mode": mode_label,
+            "startedAt": now_text(),
+            "finishedAt": "",
+            "total": len(targets),
+            "results": [],
+            "summary": "",
+            "ids": [p["id"] for p in targets],
+        })
+
+    threading.Thread(target=_sync_worker, args=(cfg, targets), daemon=True).start()
+    return True, "已开始拉取 %d 个项目" % len(targets)
+
+
+def _sync_worker(cfg, targets):
+    results = []
+    try:
+        for p in targets:
+            try:
+                res = sync_project(cfg, p)
+            except Exception as e:                           # noqa: BLE001
+                res = {"id": p["id"], "name": p.get("name") or p["id"], "status": "failed",
+                       "message": "内部错误：%s" % e, "at": now_text()}
+            refresh_project_state(cfg)                       # 立刻让导航页看到新状态
+            with _CACHE_LOCK:
+                _UPDATE_CACHE.pop(p["id"], None)             # 更新检测的缓存作废
+            with _SYNC_LOCK:
+                SYNC_STATE["results"].append(res)
+            results.append(res)
+            print("[nav-server] 同步 %-18s [%s] %s" % (
+                p["id"], SYNC_STATUS_TEXT.get(res["status"], res["status"]), res["message"]))
+    finally:
+        summary = summarize_sync(results)
+        with _SYNC_LOCK:
+            SYNC_STATE["running"] = False
+            SYNC_STATE["finishedAt"] = now_text()
+            SYNC_STATE["summary"] = summary
+        print("[nav-server] %s" % summary)
+
+
+def sync_cli(cfg, only_ids=None):
+    """命令行 --sync：同步一遍并打印结果，返回退出码"""
+    targets = pick_sync_targets(cfg, only_ids)
+    if not targets:
+        print("没有可拉取的项目（检查这些项目的 repo 字段）")
+        return 1
+
+    print("开始拉取 %d 个项目…（git 不可用时会回退到压缩包下载）\n" % len(targets))
+    results = []
+    for p in targets:
+        res = sync_project(cfg, p)
+        refresh_project_state(cfg)
+        with _CACHE_LOCK:
+            _UPDATE_CACHE.pop(p["id"], None)
+        results.append(res)
+        print("  [%-6s] %-18s %s" % (
+            SYNC_STATUS_TEXT.get(res["status"], res["status"]), p["id"], res["message"]))
+
+    print("\n%s\n" % summarize_sync(results))
+    list_projects(cfg)
+    return 1 if any(r["status"] == "failed" for r in results) else 0
+
+
+# ---------------------------------------------------------------------------
 # 导航页
 # ---------------------------------------------------------------------------
 NAV_TEMPLATE = r"""<!DOCTYPE html>
@@ -485,6 +983,7 @@ header{position:sticky;top:0;z-index:50;backdrop-filter:blur(14px);-webkit-backd
 .c-status.error,.c-status.no-git{color:var(--err);border-color:rgba(251,113,133,.28)}
 .c-status .dot{width:6px;height:6px;border-radius:50%;background:currentColor;flex:none}
 .c-status .sub{color:var(--muted);font-size:11px}
+.c-status .spin{display:inline-block;animation:spin 1s linear infinite;color:var(--accent-2)}
 
 .c-foot{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:auto}
 .c-foot .btn{padding:7px 13px;font-size:12.5px}
@@ -528,6 +1027,7 @@ footer a:hover{color:var(--accent)}
     <h1 class="page-title">__TITLE__</h1>
     <p class="page-desc">
       这些项目都跑在同一个本地服务上，<strong>点一下就能打开</strong>，不用各自启服务器。
+      缺失的项目点「⇩ 部署」会自动下载安装，已有的点「⇩ 拉取更新」就更新代码。
       端口和项目清单都在 <code>config.json</code> 里，改完重启即可生效。
     </p>
   </section>
@@ -545,9 +1045,10 @@ footer a:hover{color:var(--accent)}
       <input type="search" id="search" class="search-input" placeholder="搜索项目名 / 描述 / 路径…" autocomplete="off">
     </div>
     <div class="actions">
+      <button class="btn primary" id="syncAll">⇩ 部署 / 拉取全部</button>
       <button class="btn" id="checkAll">⟳ 检测全部更新</button>
       <button class="btn" id="reloadCfg">↻ 重载配置</button>
-      <a class="btn primary" href="/api/status" target="_blank" rel="noopener">ⓘ 服务状态</a>
+      <a class="btn" href="/api/status" target="_blank" rel="noopener">ⓘ 服务状态</a>
     </div>
   </div>
 
@@ -575,6 +1076,9 @@ footer a:hover{color:var(--accent)}
   var PROJECTS = __PROJECTS_JSON__;
   var CONFIG = __CONFIG_JSON__;
   var results = {};
+  var syncResults = {};              // id -> {status, message}
+  var syncState = { running: false, ids: [], done: 0, total: 0 };
+  var syncTimer = null;
 
   try {
     var saved = JSON.parse(localStorage.getItem(STATE_KEY) || '{}');
@@ -611,8 +1115,44 @@ footer a:hover{color:var(--accent)}
     return '';
   }
 
+  var SYNC_TEXT = {
+    'installed': '已部署',
+    'updated': '已更新',
+    'current': '已是最新',
+    'skipped': '已跳过',
+    'failed': '拉取失败'
+  };
+
+  function syncClass(status) {
+    if (status === 'failed') return 'error';
+    if (status === 'skipped') return 'behind';
+    if (status === 'updated' || status === 'installed' || status === 'current') return 'up';
+    return '';
+  }
+
+  function syncPending(p) {
+    return syncState.running && syncState.ids.indexOf(p.id) !== -1 && !syncResults[p.id];
+  }
+
   function buildStatus(p) {
     var box = el('div', 'c-status');
+    var s = syncResults[p.id];
+
+    if (s || syncPending(p)) {
+      var status = s ? s.status : 'running';
+      box.className = 'c-status ' + (s ? syncClass(status) : '');
+      box.appendChild(el('span', 'dot'));
+      if (!s) {
+        box.appendChild(el('span', 'spin', '⇩'));
+        box.appendChild(el('span', null, '等待拉取…'));
+      } else {
+        box.appendChild(el('span', null, SYNC_TEXT[status] || status));
+        if (s.message) box.appendChild(el('span', 'sub', s.message));
+        if (!p.exists) box.appendChild(el('span', 'sub', '目录仍不存在'));
+      }
+      return box;
+    }
+
     var r = results[p.id];
 
     if (!p.exists) {
@@ -684,6 +1224,11 @@ footer a:hover{color:var(--accent)}
     foot.appendChild(check);
 
     if (p.repo) {
+      var sync = el('button', 'btn', p.exists ? '⇩ 拉取更新' : '⇩ 部署');
+      sync.setAttribute('data-sync', p.id);
+      if (syncState.running) sync.disabled = true;
+      foot.appendChild(sync);
+
       var repo = el('a', 'btn', '仓库');
       repo.href = p.repo;
       repo.target = '_blank';
@@ -719,6 +1264,90 @@ footer a:hover{color:var(--accent)}
   }
 
   function setHint(html) { hintEl.innerHTML = html; }
+
+  /* ---------- 拉取 / 部署（服务端后台跑，前端轮询进度） ---------- */
+  function absorbSync(data) {
+    syncState.running = !!data.running;
+    syncState.ids = data.ids || [];
+    syncState.done = data.done || 0;
+    syncState.total = data.total || 0;
+
+    syncResults = {};
+    (data.results || []).forEach(function (r) { syncResults[r.id] = r; });
+
+    // 服务端已经重新扫过目录，这里同步刷新卡片上的状态
+    var fresh = data.projects || {};
+    PROJECTS.forEach(function (p) {
+      var f = fresh[p.id];
+      if (!f) return;
+      if (f.exists !== p.exists || f.entry !== p.entry || f.files !== p.files) {
+        delete results[p.id];                    // 目录变了，之前的检测结果作废
+      }
+      p.exists = f.exists;
+      p.entry = f.entry;
+      p.files = f.files;
+      if (f.dir) p.dir = f.dir;
+    });
+    saveResults();
+  }
+
+  function syncProgressText() {
+    return '正在拉取 / 部署项目… <b>' + syncState.done + ' / ' + syncState.total + '</b>';
+  }
+
+  function watchSync(silent) {
+    clearInterval(syncTimer);
+    var tick = function () {
+      fetch('/api/sync-status')
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          absorbSync(data);
+          render();
+          if (!data.running) {
+            clearInterval(syncTimer);
+            var btn = document.getElementById('syncAll');
+            if (btn) { btn.disabled = false; btn.innerHTML = '⇩ 部署 / 拉取全部'; }
+            setHint(data.summary || '拉取结束');
+            return;
+          }
+          setHint(syncProgressText());
+        })
+        .catch(function () {
+          clearInterval(syncTimer);
+          var btn = document.getElementById('syncAll');
+          if (btn) btn.disabled = false;
+          setHint('拿不到拉取进度，服务还在跑吗？');
+        });
+    };
+    if (!silent) tick();
+    syncTimer = setInterval(tick, 700);
+  }
+
+  function startSync(id) {
+    var all = document.getElementById('syncAll');
+    if (all) {
+      all.disabled = true;
+      all.innerHTML = '<span class="spin">⇩</span> 拉取中…';
+    }
+    var url = '/api/sync' + (id ? '?id=' + encodeURIComponent(id) : '');
+    fetch(url, { method: 'POST' })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (!data.ok) {
+          if (all) { all.disabled = false; all.innerHTML = '⇩ 部署 / 拉取全部'; }
+          setHint('拉取没能开始：' + (data.error || '未知原因'));
+          return;
+        }
+        absorbSync(data.sync || {});
+        render();
+        setHint(syncProgressText());
+        watchSync(true);
+      })
+      .catch(function () {
+        if (all) { all.disabled = false; all.innerHTML = '⇩ 部署 / 拉取全部'; }
+        setHint('请求失败，服务还在跑吗？');
+      });
+  }
 
   /* ---------- 单个检测 ---------- */
   function checkOne(id, force) {
@@ -769,10 +1398,16 @@ footer a:hover{color:var(--accent)}
 
   /* ---------- 事件 ---------- */
   listEl.addEventListener('click', function (ev) {
-    var btn = ev.target.closest('[data-check]');
-    if (!btn) return;
-    checkOne(btn.getAttribute('data-check'), true);
+    var check = ev.target.closest('[data-check]');
+    if (check) {
+      checkOne(check.getAttribute('data-check'), true);
+      return;
+    }
+    var sync = ev.target.closest('[data-sync]');
+    if (sync && !sync.disabled) startSync(sync.getAttribute('data-sync'));
   });
+
+  document.getElementById('syncAll').addEventListener('click', function () { startSync(''); });
 
   document.getElementById('checkAll').addEventListener('click', function () { checkAll(true); });
 
@@ -803,7 +1438,24 @@ footer a:hover{color:var(--accent)}
   });
 
   render();
-  setHint('提示：检测更新只读取远端引用，不会改动你的代码 · 结果会缓存 ' + (CONFIG.cacheTTL || 0) + ' 秒');
+  setHint('提示：项目缺失时点「⇩ 部署」会自动克隆，已有项目点「⇩ 拉取更新」就更新代码 · 检测更新只读远端引用，不动你的文件');
+
+  /* 服务启动时可能正在自动拉取项目，先问一次进度 */
+  fetch('/api/sync-status')
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      absorbSync(data);
+      render();
+      if (data.running) {
+        var btn = document.getElementById('syncAll');
+        if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spin">⇩</span> 拉取中…'; }
+        setHint('服务启动时开启了自动拉取，正在同步项目…');
+        watchSync(true);
+      } else if (data.results && data.results.length) {
+        setHint('上次自动拉取：' + (data.summary || '完成'));
+      }
+    })
+    .catch(function () {});
 })();
 </script>
 </body>
@@ -842,6 +1494,9 @@ def build_nav_page(cfg):
         "port": cfg["port"],
         "cacheTTL": cfg["cacheTTL"],
         "root": str(cfg["rootPath"]),
+        "autoSync": cfg["autoSync"],
+        "syncMode": cfg["syncMode"],
+        "zipFallback": cfg["zipFallback"],
     }, ensure_ascii=False))
     return html.encode("utf-8")
 
@@ -935,6 +1590,10 @@ class NavHandler(SimpleHTTPRequestHandler):
         if path == "/api/check-update":
             return self.handle_check_update(query)
 
+        # 拉取 / 部署进度
+        if path == "/api/sync-status":
+            return self.send_json(sync_status_payload(self.cfg))
+
         # 项目静态资源
         if path.startswith("/apps/"):
             return self.serve_project(path, query)
@@ -954,6 +1613,9 @@ class NavHandler(SimpleHTTPRequestHandler):
                 self.rfile.read(length)
         except (ValueError, OSError):
             pass
+
+        if path == "/api/sync":
+            return self.handle_sync(urllib.parse.parse_qs(parsed.query))
 
         if path == "/api/reload-vault":
             # 记住命令行覆盖过的端口 / 地址，重载配置后要重新应用
@@ -987,6 +1649,10 @@ class NavHandler(SimpleHTTPRequestHandler):
             "uptime": round(time.time() - self.server.started_at, 1),
             "cacheTTL": cfg["cacheTTL"],
             "proxy": cfg["proxy"],
+            "autoSync": cfg["autoSync"],
+            "syncMode": cfg["syncMode"],
+            "zipFallback": cfg["zipFallback"],
+            "sync": {k: v for k, v in sync_status_payload().items() if k != "projects"},
             "projects": [{
                 "id": p["id"],
                 "name": p["name"],
@@ -998,6 +1664,27 @@ class NavHandler(SimpleHTTPRequestHandler):
                 "repo": p["repo"],
             } for p in cfg["projects"]],
         }
+
+    def handle_sync(self, query):
+        """POST /api/sync[?id=<id>]：后台拉取 / 部署项目，用 /api/sync-status 轮询进度"""
+        pid = (query.get("id") or [""])[0].strip()
+        only = None
+        if pid:
+            project = self.project_by_id(pid)
+            if not project:
+                return self.send_json({"ok": False, "error": "没有这个项目：%s" % pid}, status=404)
+            if not (project.get("repo") or "").strip():
+                return self.send_json(
+                    {"ok": False, "error": "项目 %s 没有配置 repo 地址，无法拉取" % pid}, status=400)
+            only = [pid]
+
+        started, why = start_sync_batch(
+            self.cfg, only_ids=only, mode_label="single" if pid else "manual",
+        )
+        if not started:
+            return self.send_json({"ok": False, "error": why}, status=409)
+        return self.send_json({"ok": True, "running": True, "message": why,
+                               "sync": sync_status_payload(self.cfg)})
 
     def handle_check_update(self, query):
         pid = (query.get("id") or [""])[0]
@@ -1128,6 +1815,10 @@ def print_banner(cfg, extra=""):
     print("  监听       %s:%d" % (cfg["host"], cfg["port"]))
     print("  导航页     http://127.0.0.1:%d/" % cfg["port"])
     print("  状态接口   http://127.0.0.1:%d/api/status" % cfg["port"])
+    auto_text = {"never": "关闭（只用界面按钮 / --sync）",
+                 "missing": "开启 · 启动时补齐缺失项目",
+                 "always": "开启 · 启动时补齐缺失 + 更新已有"}.get(cfg.get("autoSync"), "关闭")
+    print("  自动拉取   %s" % auto_text)
     print(line)
     ready = 0
     for p in cfg["projects"]:
@@ -1150,6 +1841,7 @@ def print_banner(cfg, extra=""):
 def list_projects(cfg):
     print("%-20s %-8s %-6s %s" % ("ID", "状态", "文件数", "目录"))
     print("-" * 78)
+    missing = 0
     for p in cfg["projects"]:
         if p["exists"] and p["entry"]:
             state = "就绪"
@@ -1157,7 +1849,23 @@ def list_projects(cfg):
             state = "缺入口"
         else:
             state = "缺失"
+            missing += 1
         print("%-20s %-8s %-6d %s" % (p["id"], state, p["files"], p["dir"]))
+    if missing:
+        print("\n有 %d 个项目还没下载，可以自动拉取：" % missing)
+        print("  python nav-server.py --sync          # 有 git 就 clone，没有就下载压缩包")
+        print("或者启动服务后在导航页点「⇩ 部署 / 拉取全部」")
+
+
+def auto_sync_ids(cfg):
+    """按 autoSync 设置挑出启动时要同步的项目 id"""
+    mode = cfg.get("autoSync") or "never"
+    if mode == "never":
+        return []
+    if mode == "missing":
+        return [p["id"] for p in cfg["projects"]
+                if (p.get("repo") or "").strip() and not (p["exists"] and p["entry"])]
+    return [p["id"] for p in cfg["projects"] if (p.get("repo") or "").strip()]
 
 
 def main(argv=None):
@@ -1170,6 +1878,12 @@ def main(argv=None):
     parser.add_argument("--host", help="临时覆盖监听地址")
     parser.add_argument("-q", "--quiet", action="store_true", help="不打印每个请求日志")
     parser.add_argument("--list", action="store_true", help="只列出项目状态，不启动服务")
+    parser.add_argument("--sync", action="store_true",
+                        help="拉取 / 部署一遍项目（缺失的克隆、已有的更新）后退出，不启动服务")
+    parser.add_argument("--only", help="配合 --sync：只处理这些项目 id，逗号分隔（如 a,b）")
+    parser.add_argument("--missing-only", action="store_true",
+                        help="配合 --sync：只安装缺失的项目，不更新已有的")
+    parser.add_argument("--no-auto-sync", action="store_true", help="本次启动不做自动拉取（覆盖 config 的 autoSync）")
     parser.add_argument("-v", "--version", action="version", version="nav-server " + VERSION)
     args = parser.parse_args(argv)
 
@@ -1186,6 +1900,21 @@ def main(argv=None):
         cfg["port"] = args.port
     if args.host:
         cfg["host"] = args.host
+
+    if args.only:
+        known = {p["id"] for p in cfg["projects"]}
+        wanted = [x.strip() for x in args.only.split(",") if x.strip()]
+        unknown = [x for x in wanted if x not in known]
+        if unknown:
+            print("配置里没有这些项目：%s" % "、".join(unknown), file=sys.stderr)
+            return 2
+        cfg["onlyIds"] = wanted
+
+    if args.sync:
+        ids = cfg.get("onlyIds")
+        if args.missing_only and not ids:
+            ids = [p["id"] for p in cfg["projects"] if not (p["exists"] and p["entry"])]
+        return sync_cli(cfg, ids)
 
     if args.list:
         list_projects(cfg)
@@ -1213,6 +1942,19 @@ def main(argv=None):
     # 记录命令行覆盖项，重载配置时保持不被覆盖回去
     httpd.port_override = cfg["port"] if args.port else None
     httpd.host_override = cfg["host"] if args.host else None
+
+    # 自动拉取：放在后台，不挡着服务启动
+    if not args.no_auto_sync:
+        ids = cfg.get("onlyIds") or auto_sync_ids(cfg)
+        if ids:
+            started, why2 = start_sync_batch(cfg, ids, mode_label="auto")
+            if started:
+                print("[nav-server] 自动拉取已开始（%s，共 %d 个项目），导航页可看进度" % (
+                    "只安装缺失" if cfg.get("autoSync") == "missing" else "安装缺失 + 更新已有", len(ids)))
+            else:
+                print("[nav-server] 自动拉取未启动：%s" % why2)
+        else:
+            print("[nav-server] 项目都在本地，无需拉取（autoSync=%s）" % cfg.get("autoSync"))
 
     if cfg.get("openOnStart"):
         threading.Thread(

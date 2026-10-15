@@ -40,7 +40,8 @@ for fname in ["nav-server.py", "nav-server.sh", "config.json", "config.example.j
     check("DEPLOY-LINUX 提到 %s" % fname, fname in deploy)
 
 print("\n[2] Python 命令行参数与文档一致")
-for flag in ["--config", "--port", "--host", "--list", "--quiet", "--version"]:
+for flag in ["--config", "--port", "--host", "--list", "--quiet", "--version",
+             "--sync", "--no-auto-sync", "--only", "--missing-only"]:
     check("nav-server.py 支持 %s" % flag, flag in py_src)
     check("文档提到 %s" % flag, flag in deploy or flag in readme)
 check("文档里的短选项 -c / -p 有对应实现",
@@ -49,14 +50,15 @@ check("文档里的短选项 -c / -p 有对应实现",
 print("\n[3] shell 子命令与文档一致")
 subcmds = re.findall(r"^\s{2}(\w[\w|-]*)\)\s", sh_src, re.M)
 subcmds = [s.split("|")[0] for s in subcmds]
-for cmd in ["start", "stop", "restart", "status", "list", "log", "fg", "config", "doctor", "install-service"]:
+for cmd in ["start", "stop", "restart", "status", "list", "sync", "log", "fg", "config", "doctor", "install-service"]:
     check("脚本实现了 %s" % cmd, cmd in subcmds, subcmds)
     check("文档提到 %s" % cmd, cmd in deploy or cmd in readme)
 check("脚本实现了 help", "help" in subcmds, subcmds)
 check("脚本用法里说明了 help", "help|-h|--help" in sh_src or "--help" in sh_src)
 
 print("\n[4] HTTP 接口与文档一致")
-for route in ["/api/health", "/api/status", "/api/check-update", "/api/reload-vault", "/apps/"]:
+for route in ["/api/health", "/api/status", "/api/check-update", "/api/reload-vault",
+              "/api/sync", "/api/sync-status", "/apps/"]:
     check("代码里有 %s" % route, route in py_src)
     check("文档提到 %s" % route, route in deploy or route in readme)
 
@@ -66,6 +68,11 @@ for key in cfg:
     check("config.json 含字段 %s" % key, key in deploy or key in readme)
 check("文档声明默认端口 1938", "1938" in deploy and cfg.get("port") == 1938)
 check("文档说明 host 默认 0.0.0.0", "0.0.0.0" in deploy and cfg.get("host") == "0.0.0.0")
+for key in ["autoSync", "syncMode", "zipFallback", "syncTimeout"]:
+    check("config.json 含自动拉取字段 %s" % key, key in cfg)
+    check("config.example.json 含 %s" % key,
+          key in (HERE / "config.example.json").read_text(encoding="utf-8"))
+    check("导航页注入 %s 的默认值" % key, key in py_src)
 
 print("\n[6] 交叉引用有效")
 check("README 链到 DEPLOY-LINUX.md", "DEPLOY-LINUX.md" in readme)
@@ -80,6 +87,8 @@ steps = {
     "克隆仓库": "git clone",
     "检查 Python": "python3 --version",
     "配置校验": "--list",
+    "自动拉取项目": "--sync",
+    "压缩包兜底": "zipFallback",
     "前台启动": "python3 nav-server.py",
     "后台启动": "nav-server.sh start",
     "健康检查": "/api/health",
@@ -96,6 +105,8 @@ print("\n[8] 文档安全性提醒")
 check("提醒了 host 暴露风险", "安全提醒" in deploy or "没有登录认证" in deploy)
 check("提醒了端口占用", "端口被占用" in deploy)
 check("提醒了没有 git 的影响", "检测更新" in deploy and "git" in deploy)
+check("README 提醒了 /api/sync 的暴露风险", "/api/sync" in readme and "公网" in readme)
+check("文档说明了不动用户自己的文件", "跳过" in readme and "不动" in readme)
 
 print("\n" + "-" * 46)
 print("通过 %d / 失败 %d" % (passed, failed))

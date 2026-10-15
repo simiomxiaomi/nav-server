@@ -5,6 +5,7 @@ nav-server 端到端实测：真启服务、真打请求。
 用法：python _e2e.py
 """
 import json
+import shutil
 import subprocess
 import sys
 import time
@@ -20,6 +21,9 @@ except (AttributeError, ValueError):
 HERE = Path(__file__).resolve().parent
 PORT = 1939                      # 用另一个端口，避免和正在运行的服务撞车
 BASE = "http://127.0.0.1:%d" % PORT
+SYNC_PORT = 1941                 # 隔离实例：专门测拉取接口
+SYNC_BASE = "http://127.0.0.1:%d" % SYNC_PORT
+SANDBOX = HERE / "_tmp_e2e"
 
 passed = 0
 failed = 0
@@ -35,9 +39,9 @@ def check(name, cond, extra=""):
         print("  [X]  %s%s" % (name, ("\n       -> " + str(extra)) if extra else ""))
 
 
-def request(path, method="GET", follow=True):
+def request(path, method="GET", follow=True, base=None):
     """返回 (状态码, 正文, 头字典)。不跟随重定向时返回原始 3xx。"""
-    url = BASE + path
+    url = (base or BASE) + path
     req = urllib.request.Request(url, method=method)
     opener = urllib.request.build_opener(
         urllib.request.HTTPRedirectHandler if follow else NoRedirect()
@@ -49,6 +53,31 @@ def request(path, method="GET", follow=True):
         return e.code, e.read(), dict(e.headers)
 
 
+def spawn_server(config_path, port, extra=None):
+    return subprocess.Popen(
+        [sys.executable, str(HERE / "nav-server.py"), "--config", str(config_path),
+         "--port", str(port), "--quiet"] + list(extra or []),
+        cwd=str(HERE),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def wait_ready(proc, base, timeout=15):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            return False
+        try:
+            st, _body, _h = request("/api/health", base=base)
+            if st == 200:
+                return True
+        except (urllib.error.URLError, OSError, ConnectionError):
+            pass
+        time.sleep(0.2)
+    return False
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -56,30 +85,12 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 def main():
     print("启动服务（端口 %d）…" % PORT)
-    proc = subprocess.Popen(
-        [sys.executable, str(HERE / "nav-server.py"), "--config", str(HERE / "config.json"),
-         "--port", str(PORT), "--quiet"],
-        cwd=str(HERE),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    # --no-auto-sync：端到端测试要确定性，不能让它在后台去联网拉项目
+    proc = spawn_server(HERE / "config.json", PORT, ["--no-auto-sync"])
 
     try:
         # 等端口就绪
-        ready = False
-        for _ in range(60):
-            if proc.poll() is not None:
-                break
-            try:
-                st, body, _ = request("/api/health")
-                if st == 200:
-                    ready = True
-                    break
-            except (urllib.error.URLError, OSError, ConnectionError):
-                pass
-            time.sleep(0.2)
-
-        if not ready:
+        if not wait_ready(proc, BASE):
             print("服务没起来，退出码：%s" % proc.poll())
             return 1
 
@@ -203,6 +214,82 @@ def main():
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             results = list(pool.map(hit, range(24)))
         check("24 个并发请求全部 200", all(results), sum(1 for r in results if not r))
+
+        print("\n[11] 拉取 / 部署 API（隔离实例，不碰真实项目）")
+        shutil.rmtree(SANDBOX, ignore_errors=True)
+        (SANDBOX / "local-mine").mkdir(parents=True)
+        (SANDBOX / "local-mine" / "index.html").write_text(
+            "<!DOCTYPE html><html><body>mine</body></html>", encoding="utf-8")
+        sync_cfg = SANDBOX / "config.json"
+        sync_cfg.write_text(json.dumps({
+            "port": SYNC_PORT, "host": "127.0.0.1", "title": "同步测试",
+            "root": ".", "branch": "main",
+            "projects": [
+                {"id": "local-mine", "name": "Local Mine", "path": "local-mine",
+                 "repo": "https://github.com/a/b"},
+                {"id": "norepo", "name": "No Repo", "path": "norepo", "repo": ""},
+            ],
+        }, ensure_ascii=False), encoding="utf-8")
+
+        proc2 = spawn_server(sync_cfg, SYNC_PORT, ["--no-auto-sync"])
+        try:
+            check("隔离实例启动成功", wait_ready(proc2, SYNC_BASE))
+
+            st, body, _ = request("/api/sync-status", base=SYNC_BASE)
+            snap = json.loads(body)
+            check("sync-status 返回 200", st == 200, st)
+            check("sync-status 结构完整",
+                  all(k in snap for k in ("running", "total", "done", "results", "summary", "ids")),
+                  sorted(snap))
+
+            st, body, _ = request("/api/status", base=SYNC_BASE)
+            info = json.loads(body)
+            check("status 暴露自动拉取配置",
+                  info.get("autoSync") == "always" and info.get("syncMode") == "ff"
+                  and info.get("zipFallback") is True, info)
+            check("status.sync 带进度快照", isinstance(info.get("sync"), dict)
+                  and "running" in info["sync"], info.get("sync"))
+
+            st, body, _ = request("/api/sync?id=nope", method="POST", base=SYNC_BASE)
+            check("拉取不存在的项目 → 404", st == 404, st)
+
+            st, body, _ = request("/api/sync?id=norepo", method="POST", base=SYNC_BASE)
+            check("项目没配 repo → 400", st == 400, st)
+
+            st, body, _ = request("/api/sync", method="POST", base=SYNC_BASE)
+            started = json.loads(body)
+            check("POST /api/sync 能启动后台任务",
+                  st == 200 and started.get("ok") is True, (st, started))
+
+            final = {"running": True}
+            for _ in range(100):
+                st, body, _ = request("/api/sync-status", base=SYNC_BASE)
+                final = json.loads(body)
+                if not final.get("running"):
+                    break
+                time.sleep(0.2)
+            check("拉取任务能正常结束", not final.get("running"), final.get("summary"))
+            check("已有目录被跳过（不碰用户的文件）",
+                  len(final.get("results") or []) == 1
+                  and final["results"][0]["status"] == "skipped", final.get("results"))
+            check("汇总里带结果", "已跳过 1" in (final.get("summary") or ""), final.get("summary"))
+            check("跳过后项目仍然可用",
+                  json.loads(request("/api/status", base=SYNC_BASE)[1])["projects"][0]["entry"] is True)
+            check("本地文件没被改动",
+                  (SANDBOX / "local-mine" / "index.html").read_text(encoding="utf-8").find("mine") >= 0)
+
+            st, body, _ = request("/", base=SYNC_BASE)
+            html2 = body.decode("utf-8")
+            check("导航页有「部署 / 拉取全部」按钮", 'id="syncAll"' in html2)
+            check("导航页卡片有单独拉取按钮", "data-sync" in html2)
+            check("导航页会轮询进度接口", "/api/sync-status" in html2)
+        finally:
+            proc2.terminate()
+            try:
+                proc2.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc2.kill()
+            shutil.rmtree(SANDBOX, ignore_errors=True)
 
     finally:
         proc.terminate()

@@ -9,6 +9,10 @@
   "proxy": "",
   "openOnStart": false,
   "timeout": 6,
+  "autoSync": "always",
+  "syncMode": "ff",
+  "zipFallback": true,
+  "syncTimeout": 120,
   "projects": [
     {
       "id": "markdown-studio",

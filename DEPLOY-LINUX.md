@@ -51,8 +51,8 @@ mv nav-server-main nav-server
 cd nav-server
 ```
 
-> ⚠️ **没有 git 会影响「检测更新」功能**：它会回退到 GitHub API，网络受限时会提示检测失败。
-> 其他功能不受影响。想要完整的更新检测体验，就装一下 git。
+> ⚠️ **没有 git 也能跑**：拉取项目时会自动改用 GitHub 压缩包下载（`zipFallback`）。
+> 「检测更新」则会回退到 GitHub API，网络受限时会提示检测失败。想要完整体验就装一下 git。
 
 ### 克隆下来应该看到这些文件
 
@@ -85,9 +85,10 @@ nano config.json      # 或者 vim / vi
 意思是「本仓库的上一级」。
 
 **刚 clone 下来时会有个问题**：默认清单里那 9 个项目（markdown-studio、diff-viewer…）
-其实还没下载，导航页会把它们标成「目录不存在」。这**不影响服务运行**，但你会看到一排红字。
+其实还没下载，导航页会把它们标成「目录不存在」。这**不影响服务运行**，而且从 v1.1 起
+可以**让服务自己把它们拉下来**（见下面的场景 D）。
 
-有三种处理方式，按需选一个：
+有四种处理方式，按需选一个：
 
 #### 场景 A：只想留 nav-server 自己，作为通用导航台（推荐首次部署）
 
@@ -143,6 +144,37 @@ git clone https://github.com/simiomxiaomi/color-lab.git
 { "port": 1938, "root": "..", "projects": [] }
 ```
 
+#### 场景 D：让 nav-server 自己把它们拉下来（v1.1 推荐）
+
+不改配置，也不用自己敲 9 条 `git clone`。默认 `"autoSync": "always"`，
+服务一启动就在后台把缺失的项目克隆下来、已有的更新到最新：
+
+```bash
+python3 nav-server.py --sync
+```
+
+输出长这样：
+
+```
+开始拉取 9 个项目…（git 不可用时会回退到压缩包下载）
+
+  [已部署] diff-viewer        已克隆 main 分支
+  [已部署] color-lab          已克隆 main 分支
+  [已更新] markdown-studio    已更新到 1f3c9ab
+  [已最新] json-viewer        已是最新（9a2b1c3）
+  [已跳过] my-notes           目录已存在且不是 git 仓库，跳过（不动你自己的文件）
+  [失败  ] focus-timer        克隆失败：unable to access 'https://github.com/…'
+
+拉取完成：已部署 2，已更新 1，已最新 1，已跳过 1，失败 1
+```
+
+也可以不敲命令，启动服务后直接在导航页点「⇩ 部署 / 拉取全部」。
+只想装缺失的：`--sync --missing-only`；只处理某几个：`--sync --only a,b`。
+
+> 没有 git 时它会去下载 GitHub 压缩包解压（`"zipFallback": true`）；
+> 网络受限就给 `config.json` 配个镜像前缀 `{ "proxy": "https://ghproxy.net" }`。
+> 已存在但不是它部署的目录一律跳过，不会覆盖你自己的文件。
+
 ### 2.2 要改的关键字段
 
 | 字段 | 默认 | 怎么改 |
@@ -152,8 +184,12 @@ git clone https://github.com/simiomxiaomi/color-lab.git
 | `root` | `..` | 项目根目录，见上面三种场景 |
 | `title` | `工作区导航` | 导航页标题 |
 | `cacheTTL` | `300` | 更新检测结果缓存秒数，`0` = 每次都重新检测 |
-| `proxy` | `""` | 网络受限时填 GitHub API 镜像前缀，如 `https://ghproxy.net` |
+| `proxy` | `""` | 网络受限时填 GitHub API / 压缩包镜像前缀，如 `https://ghproxy.net` |
 | `openOnStart` | `false` | 服务器上一般不用开；本机桌面用可以设 `true` |
+| `autoSync` | `"always"` | 启动时自动拉取：`"always"` 补缺失+更新已有 / `"missing"` 只补缺失 / `false` 关闭 |
+| `syncMode` | `"ff"` | `"ff"` 只允许快进合并（安全）；`"hard"` 强制对齐远端（会丢弃本地改动） |
+| `zipFallback` | `true` | 没装 git 或 clone 失败时，回退到 GitHub 压缩包下载解压 |
+| `syncTimeout` | `120` | clone / pull / 下载的超时秒数，慢网络调大 |
 
 > 端口别选 80 / 443（需要 root 权限），也别选已被占用的。查占用见[排错](#9-常见问题)。
 
@@ -194,13 +230,14 @@ python3 nav-server.py
 
 ```
 ──────────────────────────────────────────────────────────────
-  工作区导航  ·  nav-server v1.0.0
+  工作区导航  ·  nav-server v1.1.0
 ──────────────────────────────────────────────────────────────
   配置       /home/suxiaohan/apps/nav-server/config.json
   项目根目录 /home/suxiaohan/apps
   监听       0.0.0.0:1938
   导航页     http://127.0.0.1:1938/
   状态接口   http://127.0.0.1:1938/api/status
+  自动拉取   开启 · 启动时补齐缺失 + 更新已有
 ──────────────────────────────────────────────────────────────
   [✓] diff-viewer        → /apps/diff-viewer/
   [×] color-lab          → /apps/color-lab/
@@ -235,6 +272,7 @@ chmod +x nav-server.sh      # 只需执行一次
 
 ```bash
 ./nav-server.sh status      # 看进程状态 + 健康检查 + 项目清单
+./nav-server.sh sync        # 拉取 / 部署一遍项目（缺失的克隆，已有的更新）
 ./nav-server.sh log         # tail -f 实时日志
 ./nav-server.sh restart     # 改完配置用这个
 ./nav-server.sh stop        # 停止
@@ -261,7 +299,7 @@ curl -s http://127.0.0.1:1938/api/health
 期望看到：
 
 ```json
-{"ok": true, "service": "nav-server", "version": "1.0.0", "time": 1791986223.12}
+{"ok": true, "service": "nav-server", "version": "1.1.0", "time": 1791986223.12}
 ```
 
 再看看项目状态：
@@ -352,6 +390,7 @@ sudo firewall-cmd --reload
 cd ~/apps/nav-server
 
 ./nav-server.sh status          # 看一眼状态
+./nav-server.sh sync            # 把项目更新到最新（也可以点导航页的「⇩ 部署 / 拉取全部」）
 ./nav-server.sh log             # 排查问题
 ./nav-server.sh restart         # 改完配置重启
 git pull && ./nav-server.sh restart   # 更新自身
@@ -430,12 +469,24 @@ cat nav-server.log
 
 ### 导航页上项目标「缺失」
 
-两种可能：
+**先别急着手动克隆**——从 v1.1 起服务会自己拉：
 
-- 目录真的不存在 → 把项目克隆到 `root` 对应的位置，或修正 `path`
+```bash
+python3 nav-server.py --sync      # 或导航页点「⇩ 部署 / 拉取全部」
+```
+
+默认 `"autoSync": "always"`，启动时本来就会在后台拉。要是拉完还是「缺失」：
+
+- 看日志里 `[nav-server] 同步 xxx [失败] …` 的具体原因（网络 / 认证 / 分支名）
+- 目录真的不存在且拉不动 → 手动 `git clone` 到 `root` 对应的位置，或修正 `path`
 - `root` 指错地方了 → 用 `python3 nav-server.py --list` 看它实际找的是哪个路径
 
 标「缺入口」则是目录在，但里面没有 `index.html`。
+
+### 拉了但是「已跳过」
+
+说明那个目录已经存在、又不是 nav-server 部署的 git 仓库（比如你自己手动放的代码），
+服务**故意不碰它**，避免覆盖你的文件。想让它接管就删掉该目录再拉一次。
 
 ### 「检测更新」一直失败
 
@@ -467,17 +518,20 @@ python3 nav-server.py
 # ① 下载
 mkdir -p ~/apps && cd ~/apps && git clone https://github.com/simiomxiaomi/nav-server.git && cd nav-server
 
-# ② 看一眼默认配置（可选：按第 2 节改成自己的）
+# ② 把项目拉下来（缺失的克隆，已有的更新）
+python3 nav-server.py --sync
+
+# ③ 看一眼配置与就绪情况（可选：按第 2 节改成自己的）
 python3 nav-server.py --list
 
-# ③ 启动（前台）
+# ④ 启动（前台）
 python3 nav-server.py
 
-# ④ 另开一个终端验证
+# ⑤ 另开一个终端验证
 curl -s http://127.0.0.1:1938/api/health
 ```
 
-就这么四步。要是想后台常驻：
+就这么五步。要是想后台常驻：
 
 ```bash
 chmod +x nav-server.sh

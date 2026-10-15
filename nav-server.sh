@@ -12,6 +12,7 @@
 #     ./nav-server.sh status       查看运行状态 + 项目清单
 #     ./nav-server.sh log          实时跟踪日志
 #     ./nav-server.sh list         只看项目就绪情况
+#     ./nav-server.sh sync         拉取 / 部署一遍项目（缺失的克隆，已有的更新）
 #     ./nav-server.sh config       打印当前配置摘要
 #     ./nav-server.sh doctor       环境自检（python3 / 端口 / 配置 / git）
 #     ./nav-server.sh install-service  生成 systemd 用户服务（可选）
@@ -245,6 +246,12 @@ cmd_list() {
   "$PYTHON_BIN" "$PY_SCRIPT" --config "$CONFIG_FILE" --list
 }
 
+cmd_sync() {
+  resolve_python
+  info "拉取 / 部署项目…"
+  "$PYTHON_BIN" "$PY_SCRIPT" --config "$CONFIG_FILE" --sync "$@"
+}
+
 cmd_log() {
   [ -f "$LOG_FILE" ] || die "还没有日志文件：$LOG_FILE"
   info "跟踪日志（Ctrl+C 退出）— $LOG_FILE"
@@ -305,11 +312,11 @@ cmd_doctor() {
     ok "端口 $PORT 空闲"
   fi
 
-  # git（更新检测要用）
+  # git（拉取更新要用；没有 git 会回退到压缩包下载）
   if command -v git >/dev/null 2>&1; then
     ok "git 可用：$(git --version 2>&1)"
   else
-    warn "没有 git — 更新检测会退回 GitHub API（可能受网络限制）"
+    warn "没有 git — 会自动改用 GitHub 压缩包下载部署，更新检测也会退回 GitHub API"
   fi
 
   # 项目就绪情况
@@ -367,7 +374,8 @@ EOF
 }
 
 cmd_help() {
-  sed -n '2,25p' "$SCRIPT_PATH" | sed 's/^# \{0,1\}//'
+  # 打印脚本头部注释里的用法（一直打到第一行非注释行为止）
+  awk 'NR>1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$SCRIPT_PATH"
 }
 
 # ---------- 入口 ----------
@@ -378,6 +386,7 @@ case "$ACTION" in
   restart)          cmd_restart ;;
   status)           cmd_status ;;
   list|ls)          cmd_list ;;
+  sync|pull)        shift; cmd_sync "$@" ;;
   log|logs)         cmd_log ;;
   fg|foreground)    cmd_fg ;;
   config|conf)      cmd_config ;;
